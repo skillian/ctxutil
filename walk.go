@@ -9,16 +9,24 @@ import (
 	"unsafe"
 )
 
+type item struct {
+	prev *item
+	keyValue
+}
+
 // Walk the chain of contexts and call the each function on each one
 // until we get to an "empty" context (context.Background() or
 // context.TODO()) or the each function returns a non-nil result.
 func Walk(ctx context.Context, each func(context.Context) error) error {
+	if !Unsafe {
+		return errors.ErrUnsupported
+	}
 	for ctx != nil {
 		if err := each(ctx); err != nil {
 			return err
 		}
 		ctxReflectType := reflect.TypeOf(ctx)
-		ctxData, ok := ctxTypes[ctxReflectType]
+		ctxTp, ok := ctxTypes[ctxReflectType]
 		if !ok {
 			return fmt.Errorf(
 				"%[1]w: %[2]v (type: %[2]T)",
@@ -26,25 +34,38 @@ func Walk(ctx context.Context, each func(context.Context) error) error {
 				ctx,
 			)
 		}
-		ctx = ctxData.parent(ctx)
+		ctx = ctxTp.parent(ctx)
 	}
 	return nil
 }
 
 func WalkValues(ctx context.Context, each func(ctx context.Context, key, value interface{}) error) error {
-	return Walk(ctx, func(ctx context.Context) error {
-		ct := reflect.TypeOf(ctx)
-		if ct != valueCtxType {
-			return nil
+	if Unsafe {
+		return Walk(ctx, func(ctx context.Context) error {
+			ct := reflect.TypeOf(ctx)
+			if ct != valueCtxType {
+				return nil
+			}
+			type valueCtx struct {
+				context.Context
+				key, value interface{}
+			}
+			id := (*ifaceData)(unsafe.Pointer(&ctx))
+			vc := (*valueCtx)(id.Data)
+			return each(ctx, vc.key, vc.value)
+		})
+	}
+	it, ok := Value(ctx, (*item)(nil)).(*item)
+	if !ok {
+		return nil
+	}
+	for it != nil {
+		if err := each(ctx, it.key, it.value); err != nil {
+			return err
 		}
-		type valueCtx struct {
-			context.Context
-			key, value interface{}
-		}
-		id := (*ifaceData)(unsafe.Pointer(&ctx))
-		vc := (*valueCtx)(id.Data)
-		return each(ctx, vc.key, vc.value)
-	})
+		it = it.prev
+	}
+	return nil
 }
 
 var (
@@ -74,9 +95,12 @@ var (
 		},
 		deadlineCtxType: {
 			parent: func(ctx context.Context) context.Context {
+				type ctxFirstFieldCancelCtxParent struct {
+					Pointer unsafe.Pointer
+				}
 				id := (*ifaceData)(unsafe.Pointer(&ctx))
-				cancelCtxPtr := ((*ctxFirstFieldCancelCtxParent)(id.Data)).Pointer
-				cancelCtxIface := reflect.NewAt(cancelCtxType.Elem(), cancelCtxPtr).Interface().(context.Context)
+				// cancelCtxPtr := ((*ctxFirstFieldCancelCtxParent)(id.Data)).Pointer
+				cancelCtxIface := reflect.NewAt(cancelCtxType.Elem(), id.Data).Interface().(context.Context)
 				return getCtxParentFirstField(cancelCtxIface)
 			},
 		},
@@ -101,8 +125,4 @@ func getCtxParentFirstField(ctx context.Context) context.Context {
 	}
 	id := (*ifaceData)(unsafe.Pointer(&ctx))
 	return ((*ctxParentFirstField)(id.Data)).Context
-}
-
-type ctxFirstFieldCancelCtxParent struct {
-	Pointer unsafe.Pointer
 }
